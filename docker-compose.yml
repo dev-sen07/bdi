@@ -1,0 +1,64 @@
+services:
+  api-gateway:
+    build:
+      context: .
+      dockerfile: services/api-gateway/Dockerfile
+    ports: ["8000:8000"]
+    environment:
+      - EMBEDDING_SERVICE=embedding-service:50051
+      - RUST_ENGINE=rust-engine:50052
+      - LLM_SERVICE=http://llm-service:11434
+    depends_on: [embedding-service, rust-engine, llm-service]
+
+  embedding-service:
+    build:
+      context: .
+      dockerfile: services/embedding-service/Dockerfile
+    expose: ["50051"]
+    volumes: [model-cache:/root/.cache]
+
+  neo4j:
+    image: neo4j:5
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      - NEO4J_AUTH=none
+    volumes:
+      - ./data/neo4j:/data
+
+  rust-engine:
+    build:
+      context: .
+      dockerfile: services/rust-engine/Dockerfile
+    expose: ["50052"]
+    environment:
+      - NEO4J_URI=neo4j:7687
+    depends_on: [neo4j]
+
+  llm-service:
+    build: ./services/llm-service
+    expose: ["11434"]
+    deploy:
+      resources:
+        reservations:
+          memory: 6G
+
+  eval-runner:
+    build:
+      context: .
+      dockerfile: services/eval-runner/Dockerfile
+    profiles: ["eval"]
+    depends_on: [api-gateway]
+    environment:
+      - GATEWAY_URL=http://api-gateway:8000
+
+  frontend:
+    build:
+      context: ./services/frontend
+      dockerfile: Dockerfile
+    ports: ["3000:3000"]
+    depends_on: [api-gateway]
+
+volumes:
+  model-cache:

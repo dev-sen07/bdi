@@ -1,0 +1,4 @@
+grpcio==1.60.0
+grpcio-tools==1.60.0
+sentence-transformers
+torch --index-url https://download.pytorch.org/whl/cpu

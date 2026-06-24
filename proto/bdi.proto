@@ -1,0 +1,172 @@
+// ============================================================================
+// bdi.proto — Contratos gRPC compartidos del sistema BDI
+// ============================================================================
+//
+// Fuente de verdad de la comunicación entre microservicios. Tanto los
+// servicios Python (api-gateway, embedding-service) como el servicio Rust
+// (rust-engine) generan su código a partir de este archivo:
+//   - Python: grpcio-tools  -> bdi_pb2.py / bdi_pb2_grpc.py
+//   - Rust:   tonic-build    -> bdi.rs (vía build.rs)
+//
+// proto3: los escalares tienen valores por defecto implícitos (0, "", []),
+// lo que facilita evolucionar el esquema sin romper compatibilidad.
+// ============================================================================
+
+syntax = "proto3";
+
+// Agrupa los símbolos generados y da nombre al módulo Rust generado (`bdi`).
+package bdi;
+
+// ----------------------------------------------------------------------------
+// SERVICIO 1: EmbeddingService (Python + sentence-transformers)
+// Convierte texto -> vector denso de 384 dimensiones (all-MiniLM-L6-v2).
+// ----------------------------------------------------------------------------
+service EmbeddingService {
+  // Llamada unaria: el caso de uso es una oración/pregunta a la vez.
+  rpc Encode (TextRequest) returns (VectorResponse);
+}
+
+// ----------------------------------------------------------------------------
+// SERVICIO 2: GraphEngine (Rust + tonic)
+// Corazón de la tesis: mantiene el grafo, el índice HNSW y ejecuta el
+// algoritmo de consolidación semántica.
+// ----------------------------------------------------------------------------
+service GraphEngine {
+  // Recupera los nodos más relevantes para una consulta (retrieval).
+  rpc Query (QueryRequest) returns (QueryResponse);
+
+  // Ingiere un hecho nuevo; el motor decide insertar / fusionar / relacionar.
+  rpc Ingest (IngestRequest) returns (IngestResponse);
+
+  // Métricas del grafo para monitoreo y para el benchmark de evaluación.
+  rpc GetStats (StatsRequest) returns (StatsResponse);
+
+  // --- Gestión del conocimiento desde la interfaz (CRUD) ---
+
+  // Lista paginada de nodos del grafo, para mostrarlos/administrarlos en la UI.
+  rpc ListNodes (ListRequest) returns (ListResponse);
+
+  // Edita el contenido de un nodo. El gateway re-vectoriza el texto antes de
+  // llamar a este RPC, por eso recibe también el nuevo embedding.
+  rpc UpdateNode (UpdateRequest) returns (UpdateResponse);
+
+  // Elimina un nodo (y sus aristas) del grafo y del índice vectorial.
+  rpc DeleteNode (DeleteRequest) returns (DeleteResponse);
+}
+
+// ============================================================================
+// MENSAJES
+// ============================================================================
+
+// --- Embedding ---
+
+// Texto de entrada a vectorizar.
+message TextRequest {
+  string text = 1;
+}
+
+// Vector resultante. `repeated float` -> lista de floats (Python) / Vec<f32> (Rust).
+message VectorResponse {
+  repeated float vector = 1;
+}
+
+// --- Query (retrieval) ---
+//
+// Decisión de diseño: el api-gateway vectoriza la pregunta llamando primero a
+// EmbeddingService, y luego envía el vector ya calculado en `embedding`. Así el
+// rust-engine no depende del embedding-service (servicios desacoplados) y se
+// evita vectorizar dos veces. `text` viaja solo para logging/trazabilidad.
+message QueryRequest {
+  string text = 1;              // texto original (logs / trazabilidad)
+  int32 top_k = 2;              // cuántos resultados devolver
+  repeated float embedding = 3; // vector de la consulta (calculado por el gateway)
+}
+
+// Resultados ordenados por score descendente.
+message QueryResponse {
+  repeated NodeResult results = 1;
+}
+
+// Un nodo recuperado del grafo con su puntaje de similitud.
+message NodeResult {
+  string id = 1;      // identificador único del nodo
+  string content = 2; // texto/hecho almacenado
+  float score = 3;    // similitud coseno con la consulta [0..1]
+}
+
+// --- Ingest (consolidación) ---
+
+// Hecho entrante a consolidar (texto + embedding ya calculado por el gateway).
+message IngestRequest {
+  string text = 1;
+  repeated float embedding = 2;
+}
+
+// Resultado de la consolidación. `action` describe la decisión del motor:
+//   "inserted"  -> nodo nuevo (sin vecinos suficientemente similares)
+//   "merged"    -> fusionado con un nodo casi idéntico (>= THRESHOLD_MERGE)
+//   "related"   -> insertado y enlazado a un nodo relacionado (>= THRESHOLD_RELATE)
+//   "discarded" -> descartado (sin aporte de información)
+message IngestResponse {
+  string action = 1;
+  string node_id = 2; // id del nodo resultante (nuevo o fusionado)
+}
+
+// --- Stats ---
+
+// Sin parámetros: solicita una foto del estado global del grafo.
+message StatsRequest {}
+
+// Métricas agregadas del grafo de conocimiento.
+message StatsResponse {
+  int32 total_nodes = 1;
+  int32 total_edges = 2;
+  int32 forgotten_nodes = 3; // nodos eliminados acumulados por el olvido
+}
+
+// --- Gestión del conocimiento (CRUD) ---
+
+// Paginación para listar nodos en la interfaz.
+message ListRequest {
+  int32 limit = 1;  // máximo de nodos a devolver (0 -> usa un default del motor)
+  int32 offset = 2; // cuántos saltar (para paginar)
+}
+
+// Vista completa de un nodo para la tabla de administración. Incluye los
+// metadatos de uso/tiempo que el grafo mantiene (no solo content/score).
+message NodeInfo {
+  string id = 1;
+  string content = 2;
+  int32 uso_count = 3;
+  int32 merge_count = 4;
+  int64 created_at = 5;    // epoch en milisegundos (timestamp() de Neo4j)
+  int64 last_accessed = 6; // epoch en milisegundos
+  int32 degree = 7;        // número de aristas conectadas (conexiones)
+}
+
+message ListResponse {
+  repeated NodeInfo nodes = 1;
+  int32 total = 2; // total de nodos en el grafo (para la paginación de la UI)
+}
+
+// Edición de contenido. `embedding` es el vector recalculado por el gateway a
+// partir del nuevo `text`, de modo que el índice vectorial quede consistente.
+message UpdateRequest {
+  string id = 1;
+  string text = 2;
+  repeated float embedding = 3;
+}
+
+message UpdateResponse {
+  bool success = 1;
+  string id = 2;
+}
+
+message DeleteRequest {
+  string id = 1;
+}
+
+message DeleteResponse {
+  bool success = 1;
+  int32 deleted_edges = 2; // cuántas aristas se eliminaron junto con el nodo
+}
