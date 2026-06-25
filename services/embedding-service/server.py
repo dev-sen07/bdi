@@ -9,7 +9,7 @@ logging.basicConfig(level=logging.INFO)
 
 class EmbeddingService(bdi_pb2_grpc.EmbeddingServiceServicer):
     def __init__(self):
-        logging.info("Loading model all-MiniLM-L6-v2...")
+        logging.info("Loading model qwen3.5...")
         self.model = SentenceTransformer('all-MiniLM-L6-v2')
         logging.info("Model loaded.")
 

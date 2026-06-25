@@ -37,19 +37,27 @@ impl GraphEngine for MyGraphEngine {
         ).await.map_err(|e| Status::internal(e.to_string()))?;
         
         let mut results = Vec::new();
+        let mut hit_ids: Vec<String> = Vec::new();
         while let Ok(Some(row)) = result.next().await {
             let id = row.get::<String>("id").unwrap_or_default();
             let content = row.get::<String>("content").unwrap_or_default();
             let score = row.get::<f64>("score").unwrap_or(0.0) as f32;
-            
-            results.push(NodeResult {
-                id: id.clone(),
-                content,
-                score,
-            });
 
-            let update_q = neo4rs::query("MATCH (n:Fact {id: $id}) SET n.uso_count = coalesce(n.uso_count, 1) + 1, n.last_accessed = timestamp()")
-                .param("id", id);
+            hit_ids.push(id.clone());
+            results.push(NodeResult { id, content, score });
+        }
+
+        // Refuerzo de uso en UNA sola consulta (UNWIND) en vez de N round-trips,
+        // y FUERA del cursor de lectura para no intercalar lecturas/escrituras
+        // sobre la misma conexión (mismo criterio que en consolidation.rs).
+        if !hit_ids.is_empty() {
+            let update_q = neo4rs::query(
+                "UNWIND $ids AS hit_id
+                 MATCH (n:Fact {id: hit_id})
+                 SET n.uso_count = coalesce(n.uso_count, 1) + 1,
+                     n.last_accessed = timestamp()",
+            )
+            .param("ids", hit_ids);
             let _ = self.neo4j.run(update_q).await;
         }
 
@@ -76,15 +84,21 @@ impl GraphEngine for MyGraphEngine {
     }
 
     async fn get_stats(&self, _request: Request<StatsRequest>) -> Result<Response<StatsResponse>, Status> {
-        let mut res = self.neo4j.execute(neo4rs::query("MATCH (n:Fact) RETURN count(n) as total_nodes")).await.map_err(|e| Status::internal(e.to_string()))?;
+        // Nodos y aristas en una sola consulta (OPTIONAL MATCH conserva la fila
+        // aunque todavía no existan relaciones) -> 1 round-trip en lugar de 2.
+        let mut res = self
+            .neo4j
+            .execute(neo4rs::query(
+                "MATCH (n:Fact) WITH count(n) AS total_nodes
+                 OPTIONAL MATCH ()-[r]->()
+                 RETURN total_nodes, count(r) AS total_edges",
+            ))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
         let mut total_nodes = 0;
-        if let Ok(Some(row)) = res.next().await {
-            total_nodes = row.get::<i64>("total_nodes").unwrap_or(0) as i32;
-        }
-        
-        let mut res = self.neo4j.execute(neo4rs::query("MATCH ()-[r]->() RETURN count(r) as total_edges")).await.map_err(|e| Status::internal(e.to_string()))?;
         let mut total_edges = 0;
         if let Ok(Some(row)) = res.next().await {
+            total_nodes = row.get::<i64>("total_nodes").unwrap_or(0) as i32;
             total_edges = row.get::<i64>("total_edges").unwrap_or(0) as i32;
         }
 
@@ -240,12 +254,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Connect to Neo4j
     let neo4j_uri = std::env::var("NEO4J_URI").unwrap_or_else(|_| "127.0.0.1:7687".to_string());
+    let neo4j_user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".to_string());
+    let neo4j_pass = std::env::var("NEO4J_PASS").unwrap_or_else(|_| "".to_string());
     println!("Connecting to Neo4j at {}...", neo4j_uri);
-    
+
     let config = ConfigBuilder::default()
         .uri(&neo4j_uri)
-        .user("neo4j") 
-        .password("password")
+        .user(&neo4j_user)
+        .password(&neo4j_pass)
         .build()?;
         
     let mut graph = None;
@@ -284,6 +300,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("GraphEngine listening on {}", addr);
 
     Server::builder()
+        .tcp_nodelay(true)
         .add_service(GraphEngineServer::new(engine))
         .serve(addr)
         .await?;

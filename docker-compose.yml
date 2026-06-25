@@ -8,7 +8,13 @@ services:
       - EMBEDDING_SERVICE=embedding-service:50051
       - RUST_ENGINE=rust-engine:50052
       - LLM_SERVICE=http://llm-service:11434
-    depends_on: [embedding-service, rust-engine, llm-service]
+    depends_on:
+      embedding-service:
+        condition: service_started
+      rust-engine:
+        condition: service_started
+      llm-service:
+        condition: service_healthy
 
   embedding-service:
     build:
@@ -16,6 +22,16 @@ services:
       dockerfile: services/embedding-service/Dockerfile
     expose: ["50051"]
     volumes: [model-cache:/root/.cache]
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
   neo4j:
     image: neo4j:5
@@ -26,6 +42,12 @@ services:
       - NEO4J_AUTH=none
     volumes:
       - ./data/neo4j:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "-", "http://localhost:7474/"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
 
   rust-engine:
     build:
@@ -34,16 +56,36 @@ services:
     expose: ["50052"]
     environment:
       - NEO4J_URI=neo4j:7687
-    depends_on: [neo4j]
+      - NEO4J_USER=neo4j
+      - NEO4J_PASS=none
+    depends_on:
+      neo4j:
+        condition: service_healthy
 
   llm-service:
     build: ./services/llm-service
     expose: ["11434"]
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - OLLAMA_KEEP_ALIVE=-1
+      - OLLAMA_NUM_PARALLEL=1
+    volumes:
+      - ollama_models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
     deploy:
       resources:
         reservations:
-          memory: 6G
-
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+  
   eval-runner:
     build:
       context: .
@@ -57,8 +99,19 @@ services:
     build:
       context: ./services/frontend
       dockerfile: Dockerfile
-    ports: ["3000:3000"]
+    expose: ["3000"]
     depends_on: [api-gateway]
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports: ["80:80"]
+    volumes:
+      - ./services/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - frontend
+      - api-gateway
+    restart: unless-stopped
 
 volumes:
   model-cache:
+  ollama_models:

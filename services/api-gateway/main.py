@@ -17,8 +17,33 @@ app.add_middleware(
 
 LLM_SERVICE = os.getenv("LLM_SERVICE", "http://localhost:11434")
 
+# Modelo por defecto si Ollama no estuviera accesible para listar lo instalado.
+FALLBACK_MODEL = "qwen2.5:7b"
+
+def _pretty_label(name: str) -> str:
+    """Convierte un tag de Ollama (p.ej. 'qwen2.5:7b') en una etiqueta legible."""
+    base, _, tag = name.partition(":")
+    label = base.replace("-", " ").replace("_", " ").title()
+    return f"{label} ({tag})" if tag else label
+
+async def fetch_installed_models() -> list[dict]:
+    """Lista los modelos REALMENTE instalados en Ollama (GET /api/tags), para que el
+    selector del frontend solo ofrezca modelos disponibles localmente. Se consulta
+    en vivo: si se hace `ollama pull` de otro modelo, aparece sin redeploy."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(f"{LLM_SERVICE}/api/tags", timeout=10.0)
+        resp.raise_for_status()
+        data = resp.json()
+    models = []
+    for m in data.get("models", []):
+        name = m.get("name") or m.get("model")
+        if name:
+            models.append({"id": name, "label": _pretty_label(name)})
+    return models
+
 class QueryRequest(BaseModel):
     question: str
+    model: str | None = None
 
 class IngestRequest(BaseModel):
     text: str
@@ -42,25 +67,59 @@ async def query(request: QueryRequest):
 
     # 3. Construir Prompt con los nodos recuperados
     context_text = "\n".join([f"- {r.content}" for r in results])
-    prompt = f"Usa el siguiente contexto de nuestra base de datos inteligente para responder a la pregunta de forma precisa. Si el contexto no tiene la respuesta, usa tu conocimiento pero menciona que no está en la base de datos.\n\nContexto:\n{context_text}\n\nPregunta: {request.question}\nRespuesta:"
+    if context_text.strip():
+        prompt = (
+            f"Eres un asistente conversacional. Tienes acceso a la siguiente información relevante:\n\n"
+            f"{context_text}\n\n"
+            f"Usa esa información para enriquecer tu respuesta de forma natural, sin mencionar que proviene de ninguna base de datos ni sistema. "
+            f"Responde directamente a la pregunta como si lo supieras tú.\n\n"
+            f"Pregunta: {request.question}\nRespuesta:"
+        )
+    else:
+        prompt = (
+            f"Eres un asistente conversacional amigable. No tienes información específica sobre el tema consultado. "
+            f"Responde de forma amigable indicando que no tienes información al respecto y, si puedes, ofrece ayuda general.\n\n"
+            f"Pregunta: {request.question}\nRespuesta:"
+        )
 
     # 4. Llamar LLM Service (Ollama)
+    # El modelo lo elige el usuario en la UI (el frontend solo ofrece los instalados).
+    # Si no llega ninguno, caemos al primer modelo disponible en Ollama.
+    model = request.model
+    if not model:
+        try:
+            installed = await fetch_installed_models()
+            model = installed[0]["id"] if installed else FALLBACK_MODEL
+        except Exception:
+            model = FALLBACK_MODEL
     sources = [r.id for r in results]
     try:
         async with httpx.AsyncClient() as client:
             llm_response = await client.post(
                 f"{LLM_SERVICE}/api/generate",
                 json={
-                    "model": "llama3.1:8b",
+                    "model": model,
                     "prompt": prompt,
-                    "stream": False
+                    "stream": False,
+                    # Desactiva el "thinking": los modelos razonadores (p.ej. Qwen3)
+                    # vuelcan su cadena de pensamiento al campo `thinking` y, con un
+                    # tope de tokens, agotan el presupuesto pensando y dejan `response`
+                    # vacío. Con think=false responden directo en `response`. Es inocuo
+                    # para modelos que no razonan (lo ignoran).
+                    "think": False,
+                    "options": {
+                        "num_predict": 512
+                    }
                 },
-                timeout=60.0
+                timeout=300.0
             )
             llm_response.raise_for_status()
-            answer = llm_response.json().get("response", "")
+            answer = llm_response.json().get("response", "").strip()
+            if not answer:
+                answer = "El modelo no devolvió una respuesta. Prueba con otro modelo."
     except Exception as e:
-        answer = f"Error llamando al LLM: {str(e)}. Contexto encontrado: {context_text}"
+        error_type = type(e).__name__
+        answer = f"Error llamando al LLM ({error_type}: {str(e) or 'sin detalle'}). Contexto encontrado:\n{context_text}"
 
     return {
         "answer": answer,
@@ -144,6 +203,17 @@ async def delete_node(node_id: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/models")
+async def list_models():
+    """Modelos instalados en Ollama, para poblar dinámicamente el selector de la UI.
+    Si Ollama no responde, devuelve lista vacía (el frontend lo refleja)."""
+    try:
+        models = await fetch_installed_models()
+    except Exception:
+        models = []
+    default = models[0]["id"] if models else None
+    return {"default": default, "models": models}
 
 @app.get("/health")
 def health():

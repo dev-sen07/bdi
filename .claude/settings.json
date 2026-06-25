@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker info *)",
+      "Bash(nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader)",
+      "Bash(python3 -m py_compile services/api-gateway/main.py)",
+      "Bash(curl -s -m 120 http://localhost:8000/query -H 'Content-Type: application/json' -d '{\"question\":\"Que es la fotosintesis? responde corto.\",\"model\":\"qwen3.5:9b\"}')",
+      "Bash(curl -s -m 120 http://localhost:8000/query -H 'Content-Type: application/json' -d '{\"question\":\"Que es la fotosintesis? responde corto.\",\"model\":\"llama3.1:8b\"}')"
+    ]
+  }
+}
